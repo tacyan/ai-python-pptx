@@ -78,6 +78,9 @@ def main():
     # モデル選択
     model = st.selectbox("使用するモデル", options=["gpt-4o", "gpt-3.5-turbo"], index=0)
     
+    # バックアップオプションの追加
+    use_fallback = st.checkbox("APIクォータ超過時にバックアップモデルを使用する", value=True, help="APIクォータが超過した場合、gpt-3.5-turboにフォールバックします")
+    
     # テンプレートファイルの情報
     st.info("注意: このアプリケーションは `workspace/input/template.pptx` というパワーポイントテンプレートファイルを必要とします。")
     
@@ -143,13 +146,31 @@ def main():
                 content = uploaded_file.read().decode("utf-8")
                 
                 # ChatOpenAIモデルを初期化
-                llm = ChatOpenAI(model=model, temperature=0.0)
-                
-                # PPTXAgentを初期化
-                agent = PPTXAgent(llm=llm)
-                
-                # エージェントを実行して最終的な出力を取得
-                final_output = agent.run(user_request=content)
+                try:
+                    llm = ChatOpenAI(model=model, temperature=0.0)
+                    
+                    # PPTXAgentを初期化
+                    agent = PPTXAgent(llm=llm, use_fallback=use_fallback)
+                    
+                    # エージェントを実行して最終的な出力を取得
+                    final_output = agent.run(user_request=content)
+                except Exception as api_error:
+                    # APIクォータ超過エラーの処理
+                    if "insufficient_quota" in str(api_error):
+                        st.warning("OpenAI APIのクォータを超過しました。バックアップモデルを使用します。")
+                        if use_fallback and model != "gpt-3.5-turbo":
+                            llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0)
+                            agent = PPTXAgent(llm=llm, use_fallback=use_fallback)
+                            final_output = agent.run(user_request=content)
+                        else:
+                            st.error("OpenAI APIのクォータを超過しました。APIキーの制限を確認するか、別のAPIキーを使用してください。")
+                            st.error("この問題を解決するには：")
+                            st.error("1. OpenAIダッシュボードでAPIの使用状況と制限を確認する")
+                            st.error("2. 有料プランにアップグレードする")
+                            st.error("3. 別のAPIキーを使用する")
+                            return
+                    else:
+                        raise api_error
                 
                 # Python コードブロックが含まれている場合の処理
                 if "```python" in final_output:
@@ -188,7 +209,17 @@ def main():
                     
             except Exception as e:
                 st.error(f"エラーが発生しました: {str(e)}")
-                st.error("詳細なエラー情報を確認するには、コンソールログを確認してください。")
+                
+                # より詳細なエラーメッセージの表示
+                if "insufficient_quota" in str(e):
+                    st.error("OpenAI APIのクォータを超過しました。APIキーの制限を確認するか、別のAPIキーを使用してください。")
+                    st.error("この問題を解決するには：")
+                    st.error("1. OpenAIダッシュボードでAPIの使用状況と制限を確認する")
+                    st.error("2. 有料プランにアップグレードする")
+                    st.error("3. 別のAPIキーを使用する")
+                else:
+                    st.error("詳細なエラー情報を確認するには、コンソールログを確認してください。")
+                
                 raise e
 
     # 使用方法のガイド
