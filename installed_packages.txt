@@ -1,0 +1,8 @@
+python-pptx
+ipython
+langgraph
+langchain-community
+langchain-openai
+langchain-core
+google-generativeai
+langchain-google-genai
