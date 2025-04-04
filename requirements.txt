@@ -1,6 +1,8 @@
 langchain-core==0.3.0
 langchain-openai==0.2.0
+langchain-google-genai==0.1.5
 langgraph==0.2.22
 python-pptx==1.0.2
 streamlit==1.32.0
-ipython 
+ipython
+google-generativeai>=0.3.0 

@@ -2,16 +2,29 @@
 このモジュールはパワーポイント資料を自動生成するAIエージェントを実装します。
 LangGraphを使ってワークフロー（グラフ）を定義し、複数のLLMを連携させて処理を実行します。
 APIクォータ超過時のフォールバックメカニズムを備えています。
+OpenAIとGoogle Gemini両方のAPIに対応しています。
 
 Classes:
     PPTXAgent: PowerPoint資料を自動生成するAIエージェント
 """
 
-from typing import Any, Optional, Dict, Callable
+from typing import Any, Optional, Dict, Callable, Union
 import os
 import logging
 import time
+
+# ロガーの設定
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 from langchain_openai import ChatOpenAI
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    logger.warning("langchain_google_genai をインポートできませんでした。Google Gemini機能は無効化されます。")
+from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, StateGraph
 
 from datamodel import Judgement, State
@@ -19,10 +32,6 @@ from story_generator import StoryGenerator
 from story_evaluator import StoryEvaluator
 from slide_contents_generator import SlideContentsGenerator
 from pptx_code_generator import PPTXCodeGenerator
-
-# ロガーの設定
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 class PPTXAgent:
     """
@@ -35,32 +44,49 @@ class PPTXAgent:
         pptx_code_generator (PPTXCodeGenerator): PPTXコード生成器
         graph (StateGraph): ワークフローを表すグラフ
         use_fallback (bool): APIエラー時にフォールバックを使用するかどうか
-        fallback_llm (ChatOpenAI): フォールバック用のLLM
+        fallback_llm (BaseChatModel): フォールバック用のLLM
         max_retries (int): 最大再試行回数
+        api_provider (str): 使用するAPIプロバイダー ("OpenAI" または "Google Gemini")
     """
-    def __init__(self, llm: ChatOpenAI, use_fallback: bool = True, max_retries: int = 3):
+    def __init__(self, llm: BaseChatModel, use_fallback: bool = True, max_retries: int = 3, 
+                 api_provider: str = "OpenAI", fallback_model: Optional[str] = None):
         """
         PPTXAgentクラスの初期化
 
         Args:
-            llm (ChatOpenAI): 対話型言語モデルのインスタンス
+            llm (BaseChatModel): 対話型言語モデルのインスタンス
             use_fallback (bool, optional): APIエラー時にフォールバックを使用するかどうか。デフォルトはTrue
             max_retries (int, optional): 最大再試行回数。デフォルトは3
+            api_provider (str, optional): 使用するAPIプロバイダー。デフォルトは"OpenAI"
+            fallback_model (str, optional): フォールバック用のモデル名。指定がなければ自動選択
         """
+        # APIプロバイダーの設定
+        self.api_provider = api_provider
+        
         # フォールバックの設定
         self.use_fallback = use_fallback
         self.primary_llm = llm
         self.fallback_llm = None
-        if self.use_fallback and llm.model_name != "gpt-3.5-turbo":
+        
+        if self.use_fallback:
             try:
-                self.fallback_llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0)
+                if api_provider == "OpenAI":
+                    fallback_model_name = fallback_model or "gpt-3.5-turbo"
+                    if getattr(llm, "model_name", "") != fallback_model_name:
+                        self.fallback_llm = ChatOpenAI(model=fallback_model_name, temperature=0.0)
+                elif api_provider == "Google Gemini" and GEMINI_AVAILABLE:
+                    fallback_model_name = fallback_model or "gemini-1.5-flash"
+                    if getattr(llm, "model", "") != fallback_model_name:
+                        self.fallback_llm = ChatGoogleGenerativeAI(model=fallback_model_name, temperature=0.0)
+                else:
+                    logger.warning(f"フォールバックLLMの初期化に失敗しました: サポートされていないAPIプロバイダー ({api_provider}) または必要なライブラリがインストールされていません")
             except Exception as e:
                 logger.warning(f"フォールバックLLMの初期化に失敗しました: {e}")
                 
         self.max_retries = max_retries
         
         # 各種ジェネレーターの初期化
-        self.story_generator = StoryGenerator(llm=llm)
+        self.story_generator = StoryGenerator(llm=llm, max_retries=2)
         self.story_evaluator = StoryEvaluator(llm=llm)
         self.slide_contents_generator = SlideContentsGenerator(llm=llm)
         self.pptx_code_generator = PPTXCodeGenerator(llm=llm)
@@ -93,8 +119,9 @@ class PPTXAgent:
                 last_error = e
                 error_msg = str(e).lower()
                 
-                # APIクォータ超過エラーの場合はすぐにフォールバック
-                if "insufficient_quota" in error_msg or "rate_limit" in error_msg:
+                # APIクォータ超過エラーまたはレート制限エラーの場合はすぐにフォールバック
+                quota_errors = ["insufficient_quota", "rate_limit", "quota exceeded"]
+                if any(err in error_msg for err in quota_errors):
                     logger.warning(f"APIクォータ超過またはレート制限エラー: {e}")
                     break
                 
@@ -104,7 +131,7 @@ class PPTXAgent:
         
         # フォールバックが有効で利用可能な場合
         if self.use_fallback and self.fallback_llm is not None:
-            logger.info("フォールバックLLMを使用します")
+            logger.info(f"フォールバックLLMを使用します ({self.api_provider})")
             
             # 元のLLMを一時的にフォールバックに置き換え
             orig_llm = {}
@@ -263,7 +290,8 @@ class PPTXAgent:
         except Exception as e:
             logger.error(f"グラフの実行中にエラーが発生しました: {e}")
             # エラーが発生した場合は、簡易的なコードテンプレートを返す
-            return """
+            provider_name = "OpenAI" if self.api_provider == "OpenAI" else "Google Gemini"
+            return f"""
 # エラーが発生したため、簡易的なPPTXファイルを生成します
 from pptx import Presentation
 from pptx.util import Inches, Pt
@@ -278,7 +306,7 @@ title = slide.shapes.title
 subtitle = slide.placeholders[1]
 
 title.text = "エラーが発生しました"
-subtitle.text = "APIクォータ超過またはその他のエラーにより、プレゼンテーションを生成できませんでした。"
+subtitle.text = "{provider_name} APIエラーまたはその他のエラーにより、プレゼンテーションを生成できませんでした。"
 
 # 情報スライドを追加
 bullet_slide_layout = prs.slide_layouts[1]
@@ -291,7 +319,7 @@ tf = body.text_frame
 tf.text = "以下の方法を試してください："
 
 p = tf.add_paragraph()
-p.text = "1. OpenAIダッシュボードでAPIの使用状況と制限を確認する"
+p.text = "1. {provider_name}ダッシュボードでAPIの使用状況と制限を確認する"
 p.level = 1
 
 p = tf.add_paragraph()
@@ -300,6 +328,10 @@ p.level = 1
 
 p = tf.add_paragraph()
 p.text = "3. 別のAPIキーを使用する"
+p.level = 1
+
+p = tf.add_paragraph()
+p.text = "4. 別のAIプロバイダーを試す"
 p.level = 1
 
 # プレゼンテーションを保存
